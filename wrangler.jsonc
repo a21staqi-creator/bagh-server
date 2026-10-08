@@ -1,0 +1,6 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "bagh-server",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-09"
+}
