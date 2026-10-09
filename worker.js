@@ -2,7 +2,6 @@
 // Password authentication + KV database compatibility.
 // Required KV binding: BAGH_KV
 // Required secret: DB_KEY
-// Never log passwords, tokens, or private user data.
 
 const TOP = new Set([
   "users",
@@ -60,7 +59,6 @@ const keyFor = (s) => "db:" + s.join("/");
 const enc = new TextEncoder();
 
 function logError(label, error) {
-  // Never log passwords, tokens, request bodies, or DB_KEY.
   console.error(
     label,
     error instanceof Error
@@ -148,9 +146,7 @@ function applyServerValues(v, existing) {
     const out = {};
 
     for (const [k, val] of Object.entries(v)) {
-      if (BAD.has(k)) {
-        continue;
-      }
+      if (BAD.has(k)) continue;
 
       out[k] = applyServerValues(
         val,
@@ -166,8 +162,7 @@ function applyServerValues(v, existing) {
   return v;
 }
 
-// Read JSON safely.
-// A malformed legacy value must not crash the entire user listing.
+// Safely read JSON values from KV.
 async function readKVJson(env, key) {
   const raw = await env.BAGH_KV.get(key);
 
@@ -178,13 +173,12 @@ async function readKVJson(env, key) {
   try {
     return JSON.parse(raw);
   } catch (error) {
-    // Do not log the value; it may contain private user data.
     logError("BAGH_KV_INVALID_JSON", error);
     return null;
   }
 }
 
-// Collect every page returned by KV.list().
+// Read all pages from KV.list().
 async function listAll(env, prefix) {
   const keys = [];
   let cursor;
@@ -230,7 +224,6 @@ async function getValue(env, segs) {
   const exactKey = keyFor(segs);
   const exact = await readKVJson(env, exactKey);
 
-  // If an exact value exists, do not unnecessarily list its children.
   if (exact !== null) {
     return exact;
   }
@@ -247,7 +240,6 @@ async function getValue(env, segs) {
   for (const item of listed) {
     const tail = item.name.slice(prefix.length);
 
-    // Only build the immediate children of this node.
     if (
       !tail ||
       tail.includes("/") ||
@@ -292,7 +284,9 @@ async function putValue(env, segs, value) {
         : batch.cursor;
 
       if (!batch.list_complete && !cursor) {
-        throw new Error("KV deletion listing did not provide a cursor");
+        throw new Error(
+          "KV deletion listing did not provide a cursor"
+        );
       }
     } while (cursor);
 
@@ -305,9 +299,7 @@ async function putValue(env, segs, value) {
   );
 }
 
-// Combines existing database users with password-authenticated users.
-// This is a read-only compatibility view.
-// It does not delete or rewrite auth:user records.
+// Combine legacy users and password-authenticated users.
 async function getCombinedUsers(env) {
   let existing = null;
 
@@ -315,7 +307,6 @@ async function getCombinedUsers(env) {
     existing = await getValue(env, ["users"]);
   } catch (error) {
     logError("BAGH_EXISTING_USERS_READ_ERROR", error);
-    // Continue so existing auth:user accounts can still be listed.
   }
 
   const out =
@@ -345,12 +336,12 @@ async function getCombinedUsers(env) {
           continue;
         }
 
-        // Prefer phone digits to match phone-keyed legacy records.
         const phoneKey = String(user.phone || "")
           .replace(/\D/g, "");
 
         const uid = String(
-          user.uid || item.name.slice("auth:user:".length)
+          user.uid ||
+          item.name.slice("auth:user:".length)
         );
 
         const userKey = phoneKey || uid;
@@ -361,8 +352,6 @@ async function getCombinedUsers(env) {
 
         const publicUser = stripPrivateFields(user);
 
-        // Keep legacy fields when they exist, but never expose
-        // authentication secrets from either source.
         const legacy =
           out[userKey] &&
           typeof out[userKey] === "object" &&
@@ -384,7 +373,9 @@ async function getCombinedUsers(env) {
       : batch.cursor;
 
     if (!batch.list_complete && !cursor) {
-      throw new Error("Auth user listing did not provide a cursor");
+      throw new Error(
+        "Auth user listing did not provide a cursor"
+      );
     }
   } while (cursor);
 
@@ -908,7 +899,6 @@ export default {
           return json(value);
         }
 
-        // Preserve the existing restriction on top-level reads.
         if (segs.length === 1) {
           return json(
             { error: "forbidden" },
@@ -984,10 +974,16 @@ export default {
     } catch (error) {
       logError("BAGH_DB_ROUTE_ERROR", error);
 
-      // Do not expose internal details or secrets to clients.
+      // TEMPORARY DIAGNOSTIC:
+      // Remove "diagnostic" after fixing the underlying problem.
+      const diagnostic = error instanceof Error
+        ? error.message.slice(0, 200)
+        : String(error).slice(0, 200);
+
       return json(
         {
           error: "database temporarily unavailable",
+          diagnostic,
         },
         500
       );
