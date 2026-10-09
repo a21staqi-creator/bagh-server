@@ -1,6 +1,15 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "bagh-server",
-  "main": "worker.js",
-  "compatibility_date": "2026-10-01"
+"$schema": "node_modules/wrangler/config-schema.json",
+"name": "bagh-server",
+"main": "worker.js",
+"compatibility_date": "2026-10-01",
+"observability": {
+"enabled": true
+},
+"kv_namespaces": [
+{
+"binding": "BAGH_KV",
+"id": "d61d843780764ea3bda419c335653de1"
+}
+]
 }
