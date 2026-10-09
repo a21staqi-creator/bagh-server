@@ -1,6 +1,8 @@
-// Bagh Cloudflare Worker starter.
-// Requires a Cloudflare KV namespace binding named BAGH_KV.
-// This is a migration starter, not a drop-in replacement for every Firebase/SSE behavior.
+// Bagh Cloudflare Worker: password-based registration/login, no SMS.
+// Requires KV binding BAGH_KV. Configure DB_KEY as a secret before exposing DB routes.
+// Passwords are PBKDF2-hashed; auth sessions are stored in KV and returned as bearer tokens.
+// Account recovery is a support-request flow only; support must verify ownership manually.
+
 const TOP = new Set(["users", "userchats", "chats", "calls", "ans", "ice"]);
 const BAD = new Set(["__proto__", "constructor", "prototype"]);
 const cors = {
@@ -56,7 +58,6 @@ async function getValue(env, segs) {
     }
     return out;
   }
-  // KV is key/value, so read exact node and descendants to rebuild a subtree.
   const exact = await env.BAGH_KV.get(keyFor(segs), "json");
   const prefix = keyFor(segs) + "/";
   const listed = await env.BAGH_KV.list({ prefix });
@@ -85,6 +86,115 @@ async function putValue(env, segs, value) {
   }
   await env.BAGH_KV.put(k, JSON.stringify(value));
 }
+const enc = new TextEncoder();
+function b64url(bytes) {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+function fromB64url(s) {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  return Uint8Array.from(atob(s), c => c.charCodeAt(0));
+}
+async function hashPassword(password, saltText) {
+  const salt = saltText ? fromB64url(saltText) : crypto.getRandomValues(new Uint8Array(16));
+  const material = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations: 210000 }, material, 256);
+  return { salt: b64url(salt), hash: b64url(new Uint8Array(bits)) };
+}
+async function passwordMatches(password, salt, expected) {
+  const result = await hashPassword(password, salt);
+  const a = enc.encode(result.hash), b = enc.encode(expected);
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+function normalizePhone(input) {
+  const p = String(input || "").replace(/[\s()-]/g, "");
+  if (!/^\+?[0-9]{8,15}$/.test(p)) return null;
+  return p.startsWith("+") ? p : "+" + p;
+}
+function phoneId(phone) {
+  // KV key doesn't expose the phone in key listings; deterministic lookup key.
+  return "auth:phone:" + phone.replace(/[^0-9]/g, "");
+}
+async function readJson(req) {
+  const b = await readBody(req);
+  return b && typeof b === "object" && !Array.isArray(b) ? b : {};
+}
+async function makeSession(env, user) {
+  const token = b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const session = { uid: user.uid, createdAt: Date.now(), expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000 };
+  await env.BAGH_KV.put("auth:session:" + token, JSON.stringify(session), { expirationTtl: 60 * 60 * 24 * 30 });
+  return token;
+}
+async function currentUser(req, env) {
+  const h = req.headers.get("Authorization") || "";
+  const m = h.match(/^Bearer\s+([A-Za-z0-9_-]+)$/);
+  if (!m) return null;
+  const raw = await env.BAGH_KV.get("auth:session:" + m[1], "json");
+  if (!raw || raw.expiresAt < Date.now()) return null;
+  const user = await env.BAGH_KV.get("auth:user:" + raw.uid, "json");
+  return user ? { ...user, token: m[1] } : null;
+}
+async function authRoute(req, env, path) {
+  if (path === "/auth/register" && req.method === "POST") {
+    const b = await readJson(req);
+    const phone = normalizePhone(b.phone);
+    const password = String(b.password || "");
+    const displayName = String(b.displayName || "").trim().slice(0, 60);
+    if (!phone) return json({ ok: false, err: "شماره موبایل معتبر نیست." }, 400);
+    if (password.length < 10 || password.length > 128) return json({ ok: false, err: "رمز عبور باید حداقل ۱۰ نویسه داشته باشد." }, 400);
+    const idx = phoneId(phone);
+    if (await env.BAGH_KV.get(idx)) return json({ ok: false, err: "این شماره قبلاً ثبت‌نام کرده است؛ وارد شوید." }, 409);
+    const uid = crypto.randomUUID();
+    const ph = await hashPassword(password);
+    const user = { uid, phone, displayName: displayName || "کاربر باغ", passwordSalt: ph.salt, passwordHash: ph.hash, createdAt: Date.now() };
+    await env.BAGH_KV.put("auth:user:" + uid, JSON.stringify(user));
+    await env.BAGH_KV.put(idx, uid);
+    const token = await makeSession(env, user);
+    return json({ ok: true, token, user: { uid, phone, displayName: user.displayName } }, 201);
+  }
+  if (path === "/auth/login" && req.method === "POST") {
+    const b = await readJson(req);
+    const phone = normalizePhone(b.phone);
+    const password = String(b.password || "");
+    if (!phone || !password) return json({ ok: false, err: "شماره موبایل و رمز عبور را وارد کنید." }, 400);
+    const uid = await env.BAGH_KV.get(phoneId(phone));
+    if (!uid) return json({ ok: false, err: "شماره یا رمز عبور اشتباه است." }, 401);
+    const user = await env.BAGH_KV.get("auth:user:" + uid, "json");
+    if (!user || !await passwordMatches(password, user.passwordSalt, user.passwordHash))
+      return json({ ok: false, err: "شماره یا رمز عبور اشتباه است." }, 401);
+    const token = await makeSession(env, user);
+    return json({ ok: true, token, user: { uid, phone, displayName: user.displayName } });
+  }
+  if (path === "/auth/profile" && req.method === "GET") {
+    const user = await currentUser(req, env);
+    if (!user) return json({ ok: false, err: "نشست معتبر نیست؛ دوباره وارد شوید." }, 401);
+    return json({ ok: true, user: { uid: user.uid, phone: user.phone, displayName: user.displayName } });
+  }
+  if (path === "/auth/logout" && req.method === "POST") {
+    const h = req.headers.get("Authorization") || "";
+    const m = h.match(/^Bearer\s+([A-Za-z0-9_-]+)$/);
+    if (m) await env.BAGH_KV.delete("auth:session:" + m[1]);
+    return json({ ok: true });
+  }
+  if (path === "/auth/recovery" && req.method === "POST") {
+    const b = await readJson(req);
+    const phone = normalizePhone(b.phone);
+    if (!phone) return json({ ok: false, err: "شماره موبایل معتبر نیست." }, 400);
+    const id = crypto.randomUUID();
+    const ticket = { id, phone, message: String(b.message || "").trim().slice(0, 1000), createdAt: Date.now(), status: "pending", support: "@mrmmdt" };
+    await env.BAGH_KV.put("auth:recovery:" + id, JSON.stringify(ticket), { expirationTtl: 60 * 60 * 24 * 90 });
+    return json({ ok: true, message: "درخواست ثبت شد؛ برای پیگیری به پشتیبانی پیام بدهید.", support: "@mrmmdt", ticketId: id }, 201);
+  }
+  if (path === "/auth/send" || path === "/auth/verify") {
+    return json({ ok: false, err: "ورود با پیامک هنوز فعال نیست. از ورود با رمز عبور استفاده کنید." }, 501);
+  }
+  return json({ ok: false, err: "مسیر احراز هویت پیدا نشد." }, 404);
+}
 export default {
   async fetch(req, env) {
     if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
@@ -92,30 +202,23 @@ export default {
     const url = new URL(req.url);
     let path;
     try { path = decodeURIComponent(url.pathname); } catch { return json({}, 400); }
-
     if (path === "/health") return json({ ok: true, service: "bagh-worker" });
-
-    // Do not expose development OTP codes publicly. Configure KAVENEGAR_KEY and
-    // KAVENEGAR_TEMPLATE as Worker secrets for real SMS; no secret means SMS disabled.
     if (path.startsWith("/auth/")) {
-      if (path === "/auth/send" || path === "/auth/verify") {
-        return json({ ok: false, err: "ورود پیامکی هنوز تنظیم نشده است؛ سرویس پیامک باید پیکربندی شود." }, 503);
-      }
-      if (path === "/auth/profile") return json({ ok: false, err: "احراز هویت کامل هنوز پیاده‌سازی نشده است." }, 501);
-      return json({ ok: false }, 404);
+      try { return await authRoute(req, env, path); }
+      catch { return json({ ok: false, err: "درخواست نامعتبر است." }, 400); }
     }
-
     if (!path.startsWith("/db")) return json({ error: "not found" }, 404);
     let p = path.slice(3);
-    // Optional shared key: set DB_KEY as a Worker secret and use /db/<key>/...
     if (env.DB_KEY) {
       if (p !== "/" + env.DB_KEY && !p.startsWith("/" + env.DB_KEY + "/"))
         return json({ error: "forbidden" }, 403);
       p = p.slice(env.DB_KEY.length + 1);
+    } else {
+      // Prevent unauthenticated public access to DB writes. Set DB_KEY to enable DB compatibility.
+      return json({ error: "DB_KEY secret is required" }, 503);
     }
     const segs = segments(p);
     if (!valid(segs)) return json({ error: "forbidden" }, 403);
-
     try {
       if (req.method === "GET") {
         if (segs.length === 1 && segs[0] !== "users") return json({ error: "forbidden" }, 403);
@@ -124,7 +227,7 @@ export default {
           const pub = {};
           for (const [k, u] of Object.entries(value)) {
             if (u && typeof u === "object") {
-              const { phone, bio, ...rest } = u;
+              const { phone, passwordHash, passwordSalt, ...rest } = u;
               pub[k] = rest;
             } else pub[k] = u;
           }
@@ -132,30 +235,20 @@ export default {
         }
         return json(value);
       }
-      if (req.method === "DELETE") {
-        await putValue(env, segs, null);
-        return json(null);
-      }
+      if (req.method === "DELETE") { await putValue(env, segs, null); return json(null); }
       const body = clean(applyServerValues(await readBody(req), await getValue(env, segs)));
-      if (req.method === "PUT") {
-        await putValue(env, segs, body);
-        return json(body);
-      }
+      if (req.method === "PUT") { await putValue(env, segs, body); return json(body); }
       if (req.method === "PATCH") {
         if (!body || typeof body !== "object" || Array.isArray(body)) return json({}, 400);
         const old = await getValue(env, segs);
         const merged = { ...(old && typeof old === "object" && !Array.isArray(old) ? old : {}), ...body };
-        await putValue(env, segs, merged);
-        return json(body);
+        await putValue(env, segs, merged); return json(body);
       }
       if (req.method === "POST") {
         const id = Date.now().toString(36) + crypto.randomUUID().replace(/-/g, "").slice(0, 10);
-        await putValue(env, [...segs, id], body);
-        return json({ name: id });
+        await putValue(env, [...segs, id], body); return json({ name: id });
       }
       return json({}, 405);
-    } catch {
-      return json({ error: "bad request" }, 400);
-    }
+    } catch { return json({ error: "bad request" }, 400); }
   },
 };
