@@ -1,7 +1,8 @@
 // Bagh Cloudflare Worker
-// Password authentication + KV database compatibility.
+// Password authentication + indexed KV database.
 // Required KV binding: BAGH_KV
 // Required secret: DB_KEY
+// This version does not use KV.list().
 
 const TOP = new Set([
   "users",
@@ -18,7 +19,7 @@ const BAD = new Set([
   "prototype",
 ]);
 
-const PRIVATE_USER_FIELDS = new Set([
+const PRIVATE_FIELDS = new Set([
   "password",
   "passwordHash",
   "passwordSalt",
@@ -46,6 +47,12 @@ const json = (data, status = 200) =>
     },
   });
 
+const enc = new TextEncoder();
+
+const keyFor = (segs) => "db:" + segs.join("/");
+
+const indexKey = (segs) => "dbi:" + segs.join("/");
+
 const segments = (p) =>
   p.replace(/\.json$/, "").split("/").filter(Boolean);
 
@@ -53,10 +60,6 @@ const valid = (s) =>
   s.length > 0 &&
   TOP.has(s[0]) &&
   !s.some((x) => BAD.has(x));
-
-const keyFor = (s) => "db:" + s.join("/");
-
-const enc = new TextEncoder();
 
 function logError(label, error) {
   console.error(
@@ -68,52 +71,54 @@ function logError(label, error) {
 }
 
 async function readBody(req) {
-  const t = await req.text();
+  const text = await req.text();
 
-  if (t.length > 1_000_000) {
+  if (text.length > 1_000_000) {
     throw new Error("Request body too large");
   }
 
-  return t ? JSON.parse(t) : null;
+  return text ? JSON.parse(text) : null;
 }
 
 async function readJson(req) {
-  const b = await readBody(req);
+  const value = await readBody(req);
 
-  return b &&
-    typeof b === "object" &&
-    !Array.isArray(b)
-    ? b
+  return value &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+    ? value
     : {};
 }
 
-function clean(v) {
-  if (Array.isArray(v)) {
-    return v.map(clean);
+function clean(value) {
+  if (Array.isArray(value)) {
+    return value.map(clean);
   }
 
-  if (v && typeof v === "object") {
-    const o = {};
+  if (value && typeof value === "object") {
+    const out = {};
 
-    for (const [k, val] of Object.entries(v)) {
-      if (!BAD.has(k) && val !== undefined) {
-        o[k] = val === null ? null : clean(val);
+    for (const [key, item] of Object.entries(value)) {
+      if (BAD.has(key) || item === undefined) {
+        continue;
       }
+
+      out[key] = item === null ? null : clean(item);
     }
 
-    return o;
+    return out;
   }
 
-  return v;
+  return value;
 }
 
-function stripPrivateFields(user) {
+function stripPrivate(user) {
   const out = {};
 
   for (const [key, value] of Object.entries(user || {})) {
     if (
       !BAD.has(key) &&
-      !PRIVATE_USER_FIELDS.has(key) &&
+      !PRIVATE_FIELDS.has(key) &&
       value !== undefined
     ) {
       out[key] = value;
@@ -123,20 +128,26 @@ function stripPrivateFields(user) {
   return out;
 }
 
-function applyServerValues(v, existing) {
-  if (v && typeof v === "object" && !Array.isArray(v)) {
-    if (Object.prototype.hasOwnProperty.call(v, ".sv")) {
-      if (v[".sv"] === "timestamp") {
+function applyServerValues(value, existing) {
+  if (
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  ) {
+    if (
+      Object.prototype.hasOwnProperty.call(value, ".sv")
+    ) {
+      if (value[".sv"] === "timestamp") {
         return Date.now();
       }
 
       if (
-        v[".sv"] &&
-        v[".sv"].increment != null
+        value[".sv"] &&
+        value[".sv"].increment != null
       ) {
         return (
           (typeof existing === "number" ? existing : 0) +
-          Number(v[".sv"].increment)
+          Number(value[".sv"].increment)
         );
       }
 
@@ -145,13 +156,13 @@ function applyServerValues(v, existing) {
 
     const out = {};
 
-    for (const [k, val] of Object.entries(v)) {
-      if (BAD.has(k)) continue;
+    for (const [key, item] of Object.entries(value)) {
+      if (BAD.has(key)) continue;
 
-      out[k] = applyServerValues(
-        val,
+      out[key] = applyServerValues(
+        item,
         existing && typeof existing === "object"
-          ? existing[k]
+          ? existing[key]
           : undefined
       );
     }
@@ -159,11 +170,11 @@ function applyServerValues(v, existing) {
     return out;
   }
 
-  return v;
+  return value;
 }
 
-// Safely read JSON values from KV.
-async function readKVJson(env, key) {
+// Read one KV key without listing.
+async function readKV(env, key) {
   const raw = await env.BAGH_KV.get(key);
 
   if (raw === null) {
@@ -173,34 +184,39 @@ async function readKVJson(env, key) {
   try {
     return JSON.parse(raw);
   } catch (error) {
-    logError("BAGH_KV_INVALID_JSON", error);
+    logError("BAGH_INVALID_JSON", error);
     return null;
   }
 }
 
-// Read all pages from KV.list().
-async function listAll(env, prefix) {
-  const keys = [];
-  let cursor;
+// Maintain an index of immediate children.
+// This replaces KV.list() for newly written data.
+async function updateChildIndex(env, parent, child, add) {
+  if (!child || BAD.has(child)) return;
 
-  do {
-    const result = await env.BAGH_KV.list({
-      prefix,
-      ...(cursor ? { cursor } : {}),
-    });
+  const key = indexKey(parent);
+  const stored = await readKV(env, key);
 
-    keys.push(...result.keys);
+  const children = Array.isArray(stored)
+    ? stored.filter(
+        (item) =>
+          typeof item === "string" &&
+          !BAD.has(item)
+      )
+    : [];
 
-    cursor = result.list_complete
-      ? undefined
-      : result.cursor;
+  const set = new Set(children);
 
-    if (!result.list_complete && !cursor) {
-      throw new Error("KV listing did not provide a cursor");
-    }
-  } while (cursor);
+  if (add) {
+    set.add(child);
+  } else {
+    set.delete(child);
+  }
 
-  return keys;
+  await env.BAGH_KV.put(
+    key,
+    JSON.stringify(Array.from(set))
+  );
 }
 
 async function getValue(env, segs) {
@@ -208,10 +224,7 @@ async function getValue(env, segs) {
     const out = {};
 
     for (const top of TOP) {
-      const value = await readKVJson(
-        env,
-        keyFor([top])
-      );
+      const value = await readKV(env, keyFor([top]));
 
       if (value !== null) {
         out[top] = value;
@@ -221,172 +234,212 @@ async function getValue(env, segs) {
     return out;
   }
 
-  const exactKey = keyFor(segs);
-  const exact = await readKVJson(env, exactKey);
+  const exact = await readKV(env, keyFor(segs));
 
   if (exact !== null) {
     return exact;
   }
 
-  const prefix = exactKey + "/";
-  const listed = await listAll(env, prefix);
+  // Reconstruct this node from its indexed children.
+  const children = await readKV(env, indexKey(segs));
 
-  if (!listed.length) {
+  if (!Array.isArray(children) || !children.length) {
     return null;
   }
 
   const out = {};
 
-  for (const item of listed) {
-    const tail = item.name.slice(prefix.length);
-
+  for (const child of children) {
     if (
-      !tail ||
-      tail.includes("/") ||
-      BAD.has(tail)
+      typeof child !== "string" ||
+      !child ||
+      BAD.has(child) ||
+      child.includes("/")
     ) {
       continue;
     }
 
-    const value = await readKVJson(env, item.name);
+    const value = await getValue(
+      env,
+      [...segs, child]
+    );
 
     if (value !== null) {
-      out[tail] = value;
+      out[child] = value;
     }
   }
 
   return Object.keys(out).length ? out : null;
 }
 
-async function putValue(env, segs, value) {
-  const k = keyFor(segs);
+async function deleteValue(env, segs) {
+  const key = keyFor(segs);
+  const children = await readKV(env, indexKey(segs));
 
-  if (value === null) {
-    await env.BAGH_KV.delete(k);
-
-    const prefix = k + "/";
-    let cursor;
-
-    do {
-      const batch = await env.BAGH_KV.list({
-        prefix,
-        ...(cursor ? { cursor } : {}),
-      });
-
-      await Promise.all(
-        batch.keys.map((item) =>
-          env.BAGH_KV.delete(item.name)
-        )
-      );
-
-      cursor = batch.list_complete
-        ? undefined
-        : batch.cursor;
-
-      if (!batch.list_complete && !cursor) {
-        throw new Error(
-          "KV deletion listing did not provide a cursor"
-        );
+  if (Array.isArray(children)) {
+    for (const child of children) {
+      if (
+        typeof child === "string" &&
+        child &&
+        !BAD.has(child) &&
+        !child.includes("/")
+      ) {
+        await deleteValue(env, [...segs, child]);
       }
-    } while (cursor);
+    }
+  }
 
+  await env.BAGH_KV.delete(key);
+  await env.BAGH_KV.delete(indexKey(segs));
+
+  if (segs.length > 1) {
+    await updateChildIndex(
+      env,
+      segs.slice(0, -1),
+      segs[segs.length - 1],
+      false
+    );
+  }
+}
+
+async function putValue(env, segs, value) {
+  if (value === null) {
+    await deleteValue(env, segs);
     return;
   }
 
+  const key = keyFor(segs);
+
   await env.BAGH_KV.put(
-    k,
+    key,
     JSON.stringify(value)
   );
-}
 
-// Combine legacy users and password-authenticated users.
-async function getCombinedUsers(env) {
-  let existing = null;
+  if (
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  ) {
+    const children = Object.keys(value)
+      .filter(
+        (child) =>
+          child &&
+          !BAD.has(child) &&
+          !child.includes("/")
+      );
 
-  try {
-    existing = await getValue(env, ["users"]);
-  } catch (error) {
-    logError("BAGH_EXISTING_USERS_READ_ERROR", error);
+    await env.BAGH_KV.put(
+      indexKey(segs),
+      JSON.stringify(children)
+    );
+  } else if (Array.isArray(value)) {
+    await env.BAGH_KV.put(
+      indexKey(segs),
+      JSON.stringify(
+        value.map((_, i) => String(i))
+      )
+    );
   }
 
-  const out =
-    existing &&
-    typeof existing === "object" &&
-    !Array.isArray(existing)
-      ? { ...existing }
-      : {};
+  if (segs.length > 1) {
+    await updateChildIndex(
+      env,
+      segs.slice(0, -1),
+      segs[segs.length - 1],
+      true
+    );
+  }
+}
 
-  let cursor;
+// Public user list is stored as one direct KV value.
+// No KV.list() call is needed.
+async function getCombinedUsers(env) {
+  const value = await readKV(env, keyFor(["users"]));
 
-  do {
-    const batch = await env.BAGH_KV.list({
-      prefix: "auth:user:",
-      ...(cursor ? { cursor } : {}),
-    });
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value)
+  ) {
+    return {};
+  }
 
-    for (const item of batch.keys) {
-      try {
-        const user = await readKVJson(env, item.name);
+  const out = {};
 
-        if (
-          !user ||
-          typeof user !== "object" ||
-          Array.isArray(user)
-        ) {
-          continue;
-        }
-
-        const phoneKey = String(user.phone || "")
-          .replace(/\D/g, "");
-
-        const uid = String(
-          user.uid ||
-          item.name.slice("auth:user:".length)
-        );
-
-        const userKey = phoneKey || uid;
-
-        if (!userKey || BAD.has(userKey)) {
-          continue;
-        }
-
-        const publicUser = stripPrivateFields(user);
-
-        const legacy =
-          out[userKey] &&
-          typeof out[userKey] === "object" &&
-          !Array.isArray(out[userKey])
-            ? stripPrivateFields(out[userKey])
-            : {};
-
-        out[userKey] = {
-          ...publicUser,
-          ...legacy,
-        };
-      } catch (error) {
-        logError("BAGH_AUTH_USER_READ_ERROR", error);
-      }
+  for (const [key, user] of Object.entries(value)) {
+    if (
+      !key ||
+      BAD.has(key) ||
+      !user ||
+      typeof user !== "object" ||
+      Array.isArray(user)
+    ) {
+      continue;
     }
 
-    cursor = batch.list_complete
-      ? undefined
-      : batch.cursor;
-
-    if (!batch.list_complete && !cursor) {
-      throw new Error(
-        "Auth user listing did not provide a cursor"
-      );
-    }
-  } while (cursor);
+    out[key] = stripPrivate(user);
+  }
 
   return out;
+}
+
+async function savePublicUser(env, user) {
+  const phoneKey = String(user.phone || "")
+    .replace(/\D/g, "");
+
+  const userKey = phoneKey || user.uid;
+
+  if (!userKey || BAD.has(userKey)) {
+    throw new Error("Invalid public user key");
+  }
+
+  const current = await readKV(
+    env,
+    keyFor(["users"])
+  );
+
+  const users =
+    current &&
+    typeof current === "object" &&
+    !Array.isArray(current)
+      ? { ...current }
+      : {};
+
+  const old =
+    users[userKey] &&
+    typeof users[userKey] === "object" &&
+    !Array.isArray(users[userKey])
+      ? stripPrivate(users[userKey])
+      : {};
+
+  users[userKey] = {
+    ...old,
+    uid: user.uid,
+    phone: user.phone,
+    displayName: user.displayName || "کاربر باغ",
+    createdAt: user.createdAt || Date.now(),
+    online: true,
+  };
+
+  await env.BAGH_KV.put(
+    keyFor(["users"]),
+    JSON.stringify(users)
+  );
+
+  // Ensure the users root has a matching child index.
+  await updateChildIndex(
+    env,
+    [],
+    "users",
+    true
+  );
 }
 
 function b64url(bytes) {
   let s = "";
 
-  for (const b of bytes) {
-    s += String.fromCharCode(b);
+  for (const byte of bytes) {
+    s += String.fromCharCode(byte);
   }
 
   return btoa(s)
@@ -395,8 +448,10 @@ function b64url(bytes) {
     .replace(/=+$/g, "");
 }
 
-function fromB64url(s) {
-  s = s.replace(/-/g, "+").replace(/_/g, "/");
+function fromB64url(value) {
+  let s = value
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
 
   while (s.length % 4) {
     s += "=";
@@ -464,14 +519,16 @@ async function passwordMatches(password, salt, expected) {
 }
 
 function normalizePhone(input) {
-  const p = String(input || "")
+  const phone = String(input || "")
     .replace(/[\s()-]/g, "");
 
-  if (!/^\+?[0-9]{8,15}$/.test(p)) {
+  if (!/^\+?[0-9]{8,15}$/.test(phone)) {
     return null;
   }
 
-  return p.startsWith("+") ? p : "+" + p;
+  return phone.startsWith("+")
+    ? phone
+    : "+" + phone;
 }
 
 function phoneId(phone) {
@@ -503,16 +560,18 @@ async function makeSession(env, user) {
 }
 
 async function currentUser(req, env) {
-  const h = req.headers.get("Authorization") || "";
-  const m = h.match(/^Bearer\s+([A-Za-z0-9_-]+)$/);
+  const header =
+    req.headers.get("Authorization") || "";
 
-  if (!m) {
-    return null;
-  }
+  const match = header.match(
+    /^Bearer\s+([A-Za-z0-9_-]+)$/
+  );
 
-  const session = await readKVJson(
+  if (!match) return null;
+
+  const session = await readKV(
     env,
-    "auth:session:" + m[1]
+    "auth:session:" + match[1]
   );
 
   if (
@@ -523,13 +582,13 @@ async function currentUser(req, env) {
     return null;
   }
 
-  const user = await readKVJson(
+  const user = await readKV(
     env,
     "auth:user:" + session.uid
   );
 
   return user
-    ? { ...user, token: m[1] }
+    ? { ...user, token: match[1] }
     : null;
 }
 
@@ -538,12 +597,13 @@ async function authRoute(req, env, path) {
     path === "/auth/register" &&
     req.method === "POST"
   ) {
-    const b = await readJson(req);
-    const phone = normalizePhone(b.phone);
-    const password = String(b.password || "");
-    const displayName = String(b.displayName || "")
-      .trim()
-      .slice(0, 60);
+    const body = await readJson(req);
+    const phone = normalizePhone(body.phone);
+    const password = String(body.password || "");
+
+    const displayName = String(
+      body.displayName || ""
+    ).trim().slice(0, 60);
 
     if (!phone) {
       return json(
@@ -568,9 +628,9 @@ async function authRoute(req, env, path) {
       );
     }
 
-    const idx = phoneId(phone);
+    const phoneIndex = phoneId(phone);
 
-    if (await env.BAGH_KV.get(idx)) {
+    if (await env.BAGH_KV.get(phoneIndex)) {
       return json(
         {
           ok: false,
@@ -581,14 +641,14 @@ async function authRoute(req, env, path) {
     }
 
     const uid = crypto.randomUUID();
-    const ph = await hashPassword(password);
+    const passwordData = await hashPassword(password);
 
     const user = {
       uid,
       phone,
       displayName: displayName || "کاربر باغ",
-      passwordSalt: ph.salt,
-      passwordHash: ph.hash,
+      passwordSalt: passwordData.salt,
+      passwordHash: passwordData.hash,
       createdAt: Date.now(),
     };
 
@@ -597,7 +657,13 @@ async function authRoute(req, env, path) {
       JSON.stringify(user)
     );
 
-    await env.BAGH_KV.put(idx, uid);
+    await env.BAGH_KV.put(
+      phoneIndex,
+      uid
+    );
+
+    // Save the public user directly; no KV.list().
+    await savePublicUser(env, user);
 
     const token = await makeSession(env, user);
 
@@ -619,9 +685,9 @@ async function authRoute(req, env, path) {
     path === "/auth/login" &&
     req.method === "POST"
   ) {
-    const b = await readJson(req);
-    const phone = normalizePhone(b.phone);
-    const password = String(b.password || "");
+    const body = await readJson(req);
+    const phone = normalizePhone(body.phone);
+    const password = String(body.password || "");
 
     if (!phone || !password) {
       return json(
@@ -647,7 +713,7 @@ async function authRoute(req, env, path) {
       );
     }
 
-    const user = await readKVJson(
+    const user = await readKV(
       env,
       "auth:user:" + uid
     );
@@ -668,6 +734,9 @@ async function authRoute(req, env, path) {
         401
       );
     }
+
+    // Refresh public user entry after successful login.
+    await savePublicUser(env, user);
 
     const token = await makeSession(env, user);
 
@@ -712,12 +781,16 @@ async function authRoute(req, env, path) {
     path === "/auth/logout" &&
     req.method === "POST"
   ) {
-    const h = req.headers.get("Authorization") || "";
-    const m = h.match(/^Bearer\s+([A-Za-z0-9_-]+)$/);
+    const header =
+      req.headers.get("Authorization") || "";
 
-    if (m) {
+    const match = header.match(
+      /^Bearer\s+([A-Za-z0-9_-]+)$/
+    );
+
+    if (match) {
       await env.BAGH_KV.delete(
-        "auth:session:" + m[1]
+        "auth:session:" + match[1]
       );
     }
 
@@ -728,8 +801,8 @@ async function authRoute(req, env, path) {
     path === "/auth/recovery" &&
     req.method === "POST"
   ) {
-    const b = await readJson(req);
-    const phone = normalizePhone(b.phone);
+    const body = await readJson(req);
+    const phone = normalizePhone(body.phone);
 
     if (!phone) {
       return json(
@@ -746,7 +819,7 @@ async function authRoute(req, env, path) {
     const ticket = {
       id,
       phone,
-      message: String(b.message || "")
+      message: String(body.message || "")
         .trim()
         .slice(0, 1000),
       createdAt: Date.now(),
@@ -816,11 +889,12 @@ export default {
       );
     }
 
-    const url = new URL(req.url);
     let path;
 
     try {
-      path = decodeURIComponent(url.pathname);
+      path = decodeURIComponent(
+        new URL(req.url).pathname
+      );
     } catch (error) {
       logError("BAGH_PATH_ERROR", error);
       return json({}, 400);
@@ -859,14 +933,14 @@ export default {
       );
     }
 
-    let p = path.slice(3);
-
     if (!env.DB_KEY) {
       return json(
         { error: "DB_KEY secret is required" },
         503
       );
     }
+
+    let p = path.slice(3);
 
     if (
       p !== "/" + env.DB_KEY &&
@@ -895,8 +969,9 @@ export default {
           segs.length === 1 &&
           segs[0] === "users"
         ) {
-          const value = await getCombinedUsers(env);
-          return json(value);
+          return json(
+            await getCombinedUsers(env)
+          );
         }
 
         if (segs.length === 1) {
@@ -906,12 +981,13 @@ export default {
           );
         }
 
-        const value = await getValue(env, segs);
-        return json(value);
+        return json(
+          await getValue(env, segs)
+        );
       }
 
       if (req.method === "DELETE") {
-        await putValue(env, segs, null);
+        await deleteValue(env, segs);
         return json(null);
       }
 
@@ -974,16 +1050,9 @@ export default {
     } catch (error) {
       logError("BAGH_DB_ROUTE_ERROR", error);
 
-      // TEMPORARY DIAGNOSTIC:
-      // Remove "diagnostic" after fixing the underlying problem.
-      const diagnostic = error instanceof Error
-        ? error.message.slice(0, 200)
-        : String(error).slice(0, 200);
-
       return json(
         {
           error: "database temporarily unavailable",
-          diagnostic,
         },
         500
       );
